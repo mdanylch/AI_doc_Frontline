@@ -445,6 +445,8 @@ async def health_check(request: Request) -> Response:
 
 
 def main() -> None:
+    # Raw stdout line so CloudWatch "application" logs show activity even if logging setup fails.
+    print("[cisco-ai-docs-mcp] process start", flush=True)
     settings = get_settings()
     _configure_logging(settings)
 

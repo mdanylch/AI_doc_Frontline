@@ -14,7 +14,8 @@ USER appuser
 
 ENV HOST=0.0.0.0
 ENV PORT=8080
+ENV PYTHONUNBUFFERED=1
 
 EXPOSE 8080
 
-CMD ["sh", "-c", "exec python mcp_server.py"]
+CMD ["sh", "-c", "exec python -u mcp_server.py"]

@@ -17,3 +17,7 @@ run:
   command: sh run.sh
   network:
     port: 8080
+  env:
+    # Required for timely Python logs in CloudWatch Application log group (see README).
+    - name: PYTHONUNBUFFERED
+      value: "1"

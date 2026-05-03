@@ -26,6 +26,7 @@ FastMCP server (**streamable HTTP**) that:
 | `HTTP_SSL_VERIFY` / `SSL_CA_BUNDLE` | No | Corporate TLS overrides |
 | `LOG_LEVEL` | No | `DEBUG`, `INFO` (default), `WARNING`, … — controls verbosity |
 | `LOG_QUERY_SNIPPET` | No | If `true` (default), logs a short sanitized prefix of each docs query for troubleshooting |
+| `PYTHONUNBUFFERED` | Recommended | Set to **`1`** so logs reach CloudWatch promptly (`apprunner.yaml` / `run.sh` set this) |
 
 Copy `env.example` to `.env` for local runs (never commit `.env`).
 
@@ -57,6 +58,29 @@ MCP endpoint: `http://localhost:8080/mcp` (streamable HTTP)
 OAuth env vars on App Runner may be lowercase **`client_id`** and **`client_secret`**; those names are supported.
 
 If **Configuration source** is **API**, you can use **`apprunner.yaml`** in the repo (same commands as above).
+
+### Application logs in App Runner (CloudWatch)
+
+App Runner sends **stdout and stderr** from your process to CloudWatch. This is **not** the same stream as **deployment** or **service** logs.
+
+| What you see | Where it lives |
+|----------------|----------------|
+| Build output (`[Build]`, pip, errors) | **Deployment** logs / Service log group — stream names like `deployment/…` |
+| App Runner platform messages | **Service** log group — stream `events` |
+| **`print()`, Python `logging`, uvicorn** | **Application** log group — streams like `instance/…` |
+
+**In the console:** open your service → **Logs** tab → section **Application logs** (not only *Deployment logs*).  
+**In CloudWatch:** log group name pattern:
+
+`/aws/apprunner/<service-name>/<service-id>/application`
+
+Official detail: [Viewing App Runner logs in CloudWatch](https://docs.aws.amazon.com/apprunner/latest/dg/monitor-cwl.html).
+
+**If application logs are empty or delayed:**
+
+1. Set **`PYTHONUNBUFFERED=1`** for the runtime (this repo sets it in **`apprunner.yaml`** and **`run.sh`**). If you use **Configure all settings here** instead of the YAML file, add that variable manually in **Runtime environment variables**.
+2. Confirm the container stays healthy (TCP health check passes) — a crashing process may produce little or no application output.
+3. Open **CloudWatch → Log groups** and select the **`…/application`** group, not only **`…/service`**.
 
 ### Container image (Dockerfile)
 

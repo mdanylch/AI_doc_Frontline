@@ -15,6 +15,8 @@ import hmac
 import json
 import logging
 import sys
+import time
+import uuid
 
 import requests
 from fastmcp import FastMCP
@@ -25,10 +27,6 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
-)
 logger = logging.getLogger(__name__)
 
 _DEFAULT_TOKEN_URL = (
@@ -38,6 +36,7 @@ _DEFAULT_SCRIPT_URL = "https://scripts.cisco.com/api/v2/jobs/Mykola_Cisco_Docs"
 
 _HTTP_TIMEOUT_SEC = 120
 _MAX_ERROR_BODY_CHARS = 8000
+_MAX_QUERY_SNIPPET_CHARS = 96
 
 
 class Settings(BaseSettings):
@@ -81,6 +80,11 @@ class Settings(BaseSettings):
     port: int = Field(default=8080, validation_alias="PORT")
     mcp_path: str = Field(default="/mcp", validation_alias="MCP_PATH")
 
+    #: Logging: DEBUG, INFO, WARNING, ERROR
+    log_level: str = Field(default="INFO", validation_alias="LOG_LEVEL")
+    #: If true, log a short sanitized prefix of each docs query (no secrets).
+    log_query_snippet: bool = Field(default=True, validation_alias="LOG_QUERY_SNIPPET")
+
     @field_validator("http_ssl_verify", mode="before")
     @classmethod
     def _coerce_http_ssl_verify(cls, v: object) -> bool:
@@ -103,6 +107,41 @@ def get_settings() -> Settings:
     return _settings_cache
 
 
+def _configure_logging(settings: Settings) -> None:
+    """Stdout logging for App Runner / CloudWatch; levels from LOG_LEVEL."""
+    level_name = (settings.log_level or "INFO").upper().strip()
+    level = getattr(logging, level_name, logging.INFO)
+
+    root = logging.getLogger()
+    root.setLevel(level)
+    if not root.handlers:
+        handler = logging.StreamHandler(sys.stdout)
+        handler.setFormatter(
+            logging.Formatter(
+                "%(asctime)s %(levelname)s [%(name)s] %(message)s",
+            )
+        )
+        root.addHandler(handler)
+
+    # Third-party noise reduction unless DEBUG
+    logging.getLogger("urllib3").setLevel(logging.DEBUG if level <= logging.DEBUG else logging.WARNING)
+    logging.getLogger("httpx").setLevel(logging.DEBUG if level <= logging.DEBUG else logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
+    logging.getLogger("uvicorn.access").setLevel(logging.INFO)
+    logging.getLogger("uvicorn.error").setLevel(logging.INFO)
+    logging.getLogger("mcp").setLevel(level)
+
+
+def _sanitize_one_line(s: str, max_len: int = 400) -> str:
+    """Strip control chars / newlines for safe single-line logs (log injection defense)."""
+    if not s:
+        return ""
+    out = s.replace("\r", " ").replace("\n", " ").strip()
+    if len(out) > max_len:
+        return out[:max_len] + "..."
+    return out
+
+
 def _requests_verify(settings: Settings) -> bool | str:
     if not settings.http_ssl_verify:
         return False
@@ -111,26 +150,73 @@ def _requests_verify(settings: Settings) -> bool | str:
     return True
 
 
-def fetch_client_credentials_token(settings: Settings) -> str:
+def fetch_client_credentials_token(settings: Settings, *, correlation_id: str) -> str:
     """OAuth 2.0 client_credentials — new access token for this request."""
+    logger.info(
+        "oauth_token_begin correlation_id=%s token_url=%s",
+        correlation_id,
+        _sanitize_one_line(settings.bdb_token_url, 300),
+    )
+    t0 = time.perf_counter()
     data = {
         "grant_type": "client_credentials",
         "client_id": settings.client_id_bdb,
         "client_secret": settings.client_secret_bdb,
     }
-    r = requests.post(
-        settings.bdb_token_url,
-        data=data,
-        headers={"Content-Type": "application/x-www-form-urlencoded"},
-        timeout=_HTTP_TIMEOUT_SEC,
-        verify=_requests_verify(settings),
-    )
-    r.raise_for_status()
-    payload = r.json()
-    token = payload.get("access_token")
-    if not token or not isinstance(token, str):
-        raise RuntimeError("Token response missing access_token")
-    return token
+    try:
+        r = requests.post(
+            settings.bdb_token_url,
+            data=data,
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            timeout=_HTTP_TIMEOUT_SEC,
+            verify=_requests_verify(settings),
+        )
+        elapsed_ms = int((time.perf_counter() - t0) * 1000)
+        logger.info(
+            "oauth_token_http correlation_id=%s status=%s elapsed_ms=%s",
+            correlation_id,
+            r.status_code,
+            elapsed_ms,
+        )
+        r.raise_for_status()
+        payload = r.json()
+        token = payload.get("access_token")
+        if not token or not isinstance(token, str):
+            logger.error(
+                "oauth_token_missing_field correlation_id=%s keys=%s",
+                correlation_id,
+                list(payload.keys()) if isinstance(payload, dict) else type(payload).__name__,
+            )
+            raise RuntimeError("Token response missing access_token")
+        logger.info(
+            "oauth_token_ok correlation_id=%s elapsed_ms=%s access_token_chars=%s",
+            correlation_id,
+            elapsed_ms,
+            len(token),
+        )
+        return token
+    except requests.HTTPError as e:
+        elapsed_ms = int((time.perf_counter() - t0) * 1000)
+        detail = ""
+        if e.response is not None:
+            detail = _sanitize_one_line((e.response.text or "")[:500])
+        logger.warning(
+            "oauth_token_http_error correlation_id=%s status=%s elapsed_ms=%s detail=%s",
+            correlation_id,
+            e.response.status_code if e.response else None,
+            elapsed_ms,
+            detail,
+        )
+        raise
+    except requests.RequestException as e:
+        elapsed_ms = int((time.perf_counter() - t0) * 1000)
+        logger.warning(
+            "oauth_token_request_error correlation_id=%s elapsed_ms=%s error=%s",
+            correlation_id,
+            elapsed_ms,
+            _sanitize_one_line(str(e), 300),
+        )
+        raise
 
 
 mcp = FastMCP(name="cisco-ai-docs")
@@ -148,17 +234,35 @@ def cisco_docs_query(query: str) -> str:
         JSON string with the script API response body or structured error information.
     """
     settings = get_settings()
+    correlation_id = str(uuid.uuid4())
     q = (query or "").strip()
+    snippet = ""
+    if settings.log_query_snippet and q:
+        snippet = _sanitize_one_line(q, _MAX_QUERY_SNIPPET_CHARS)
+    logger.info(
+        "tool_cisco_docs_query_begin correlation_id=%s query_len=%s snippet=%s",
+        correlation_id,
+        len(q),
+        snippet if snippet else "(empty)",
+    )
     if not q:
+        logger.info(
+            "tool_cisco_docs_query_reject correlation_id=%s reason=empty_query",
+            correlation_id,
+        )
         return json.dumps({"error": "query must not be empty"})
 
     try:
-        token = fetch_client_credentials_token(settings)
+        token = fetch_client_credentials_token(settings, correlation_id=correlation_id)
     except requests.HTTPError as e:
         text = ""
         if e.response is not None:
             text = (e.response.text or "")[:_MAX_ERROR_BODY_CHARS]
-        logger.warning("Duo token HTTP error: %s", e.response.status_code if e.response else "?")
+        logger.warning(
+            "tool_cisco_docs_query_oauth_failed correlation_id=%s status=%s",
+            correlation_id,
+            e.response.status_code if e.response else None,
+        )
         return json.dumps(
             {
                 "error": "Failed to obtain OAuth token",
@@ -167,14 +271,30 @@ def cisco_docs_query(query: str) -> str:
             }
         )
     except requests.RequestException as e:
-        logger.warning("Duo token request failed: %s", e)
+        logger.warning(
+            "tool_cisco_docs_query_oauth_transport correlation_id=%s error=%s",
+            correlation_id,
+            _sanitize_one_line(str(e), 300),
+        )
         return json.dumps({"error": "OAuth token request failed", "message": str(e)})
     except RuntimeError as e:
+        logger.error(
+            "tool_cisco_docs_query_oauth_runtime correlation_id=%s error=%s",
+            correlation_id,
+            _sanitize_one_line(str(e), 300),
+        )
         return json.dumps({"error": str(e)})
 
     body = {"dev": "true", "input": {"query": q}}
 
+    t_script = time.perf_counter()
     try:
+        logger.info(
+            "cisco_script_request_begin correlation_id=%s url=%s",
+            correlation_id,
+            _sanitize_one_line(settings.cisco_script_job_url, 300),
+        )
+        t0 = time.perf_counter()
         r = requests.post(
             settings.cisco_script_job_url,
             json=body,
@@ -186,17 +306,43 @@ def cisco_docs_query(query: str) -> str:
             timeout=_HTTP_TIMEOUT_SEC,
             verify=_requests_verify(settings),
         )
+        elapsed_ms = int((time.perf_counter() - t0) * 1000)
+        ct = (r.headers.get("Content-Type") or "").split(";")[0].strip()
+        logger.info(
+            "cisco_script_response correlation_id=%s status=%s elapsed_ms=%s content_type=%s body_chars=%s",
+            correlation_id,
+            r.status_code,
+            elapsed_ms,
+            _sanitize_one_line(ct, 80),
+            len(r.text or ""),
+        )
         r.raise_for_status()
         try:
+            logger.info(
+                "tool_cisco_docs_query_success correlation_id=%s elapsed_ms=%s result=json",
+                correlation_id,
+                elapsed_ms,
+            )
             return json.dumps(r.json())
         except ValueError:
+            logger.info(
+                "tool_cisco_docs_query_success correlation_id=%s elapsed_ms=%s result=non_json_text",
+                correlation_id,
+                elapsed_ms,
+            )
             return json.dumps({"raw_text": (r.text or "")[:_MAX_ERROR_BODY_CHARS]})
 
     except requests.HTTPError as e:
         text = ""
         if e.response is not None:
             text = (e.response.text or "")[:_MAX_ERROR_BODY_CHARS]
-        logger.warning("Cisco script HTTP error: %s", e.response.status_code if e.response else "?")
+        elapsed_ms = int((time.perf_counter() - t_script) * 1000)
+        logger.warning(
+            "cisco_script_http_error correlation_id=%s status=%s elapsed_ms=%s",
+            correlation_id,
+            e.response.status_code if e.response else None,
+            elapsed_ms,
+        )
         return json.dumps(
             {
                 "error": "Cisco script job HTTP error",
@@ -205,8 +351,60 @@ def cisco_docs_query(query: str) -> str:
             }
         )
     except requests.RequestException as e:
-        logger.warning("Cisco script request failed: %s", e)
+        elapsed_ms = int((time.perf_counter() - t_script) * 1000)
+        logger.warning(
+            "cisco_script_transport_error correlation_id=%s elapsed_ms=%s error=%s",
+            correlation_id,
+            elapsed_ms,
+            _sanitize_one_line(str(e), 300),
+        )
         return json.dumps({"error": "Cisco script request failed", "message": str(e)})
+
+
+class HttpAccessLogMiddleware(BaseHTTPMiddleware):
+    """Log each HTTP request: method, path, client, status, duration (no secrets)."""
+
+    async def dispatch(self, request: Request, call_next):  # type: ignore[override]
+        rid = (
+            request.headers.get("x-request-id")
+            or request.headers.get("X-Request-ID")
+            or str(uuid.uuid4())
+        )
+        request.state.request_id = rid
+        client_host = request.client.host if request.client else ""
+        path_qs = request.url.path
+        if request.url.query:
+            path_qs = f"{path_qs}?{_sanitize_one_line(request.url.query, 200)}"
+        ua = _sanitize_one_line(request.headers.get("user-agent") or "", 160)
+        logger.info(
+            "http_request_begin request_id=%s method=%s path=%s client=%s user_agent=%s",
+            rid,
+            request.method,
+            path_qs,
+            client_host,
+            ua if ua else "-",
+        )
+        t0 = time.perf_counter()
+        try:
+            response = await call_next(request)
+        except Exception:
+            elapsed_ms = int((time.perf_counter() - t0) * 1000)
+            logger.exception(
+                "http_request_exception request_id=%s elapsed_ms=%s path=%s",
+                rid,
+                elapsed_ms,
+                path_qs,
+            )
+            raise
+        elapsed_ms = int((time.perf_counter() - t0) * 1000)
+        logger.info(
+            "http_request_end request_id=%s status=%s elapsed_ms=%s path=%s",
+            rid,
+            getattr(response, "status_code", "?"),
+            elapsed_ms,
+            path_qs,
+        )
+        return response
 
 
 class MCPRequestHeadersAuthMiddleware(BaseHTTPMiddleware):
@@ -218,11 +416,26 @@ class MCPRequestHeadersAuthMiddleware(BaseHTTPMiddleware):
 
     async def dispatch(self, request: Request, call_next):  # type: ignore[override]
         path = request.url.path.rstrip("/") or ""
+        rid = getattr(request.state, "request_id", None) or "-"
+        client_host = request.client.host if request.client else ""
         if path == "/health":
             return await call_next(request)
         got = request.headers.get("MCP_REQUEST_HEADERS") or ""
         if not hmac.compare_digest(got.encode("utf-8"), self._expected.encode("utf-8")):
+            logger.warning(
+                "http_auth_failed request_id=%s path=%s client=%s header_mcp_present=%s",
+                rid,
+                request.url.path,
+                client_host,
+                bool(got),
+            )
             return JSONResponse({"detail": "Unauthorized"}, status_code=401)
+        logger.debug(
+            "http_auth_ok request_id=%s path=%s client=%s",
+            rid,
+            request.url.path,
+            client_host,
+        )
         return await call_next(request)
 
 
@@ -233,13 +446,15 @@ async def health_check(request: Request) -> Response:
 
 def main() -> None:
     settings = get_settings()
+    _configure_logging(settings)
+
     middleware_list: list[Middleware] = []
     exp = (settings.mcp_request_headers or "").strip()
     if exp:
         middleware_list.append(
             Middleware(MCPRequestHeadersAuthMiddleware, expected=exp),
         )
-        logger.info("HTTP authentication enabled (header MCP_REQUEST_HEADERS)")
+        logger.info("HTTP authentication enabled (header MCP_REQUEST_HEADERS secret configured)")
     else:
         logger.warning(
             "MCP_REQUEST_HEADERS is not set — HTTP requests are not authenticated. "
@@ -250,12 +465,31 @@ def main() -> None:
     if not path.startswith("/"):
         path = "/" + path
 
+    #: Outermost middleware last: access log wraps auth + MCP routes.
+    middleware_list.append(Middleware(HttpAccessLogMiddleware))
+
+    logger.info(
+        "startup service=cisco-ai-docs-mcp host=%s port=%s mcp_path=%s log_level=%s "
+        "ssl_verify=%s log_query_snippet=%s",
+        settings.host,
+        settings.port,
+        path,
+        settings.log_level,
+        settings.http_ssl_verify,
+        settings.log_query_snippet,
+    )
+
     mcp.run(
         transport="streamable-http",
         host=settings.host,
         port=settings.port,
         path=path,
-        middleware=middleware_list or None,
+        middleware=middleware_list,
+        uvicorn_config={
+            # Custom HttpAccessLogMiddleware already logs each request in detail.
+            "access_log": False,
+            "log_level": (settings.log_level or "info").lower(),
+        },
     )
 
 

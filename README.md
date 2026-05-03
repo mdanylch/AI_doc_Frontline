@@ -24,6 +24,8 @@ FastMCP server (**streamable HTTP**) that:
 | `CISCO_SCRIPT_JOB_URL` | No | Defaults to `https://scripts.cisco.com/api/v2/jobs/Mykola_Cisco_Docs` |
 | `PORT` | No | Default `8080` (App Runner sets this) |
 | `HTTP_SSL_VERIFY` / `SSL_CA_BUNDLE` | No | Corporate TLS overrides |
+| `LOG_LEVEL` | No | `DEBUG`, `INFO` (default), `WARNING`, … — controls verbosity |
+| `LOG_QUERY_SNIPPET` | No | If `true` (default), logs a short sanitized prefix of each docs query for troubleshooting |
 
 Copy `env.example` to `.env` for local runs (never commit `.env`).
 

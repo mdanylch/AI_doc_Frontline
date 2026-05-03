@@ -42,11 +42,20 @@ MCP endpoint: `http://localhost:8080/mcp` (streamable HTTP)
 
 ## AWS App Runner
 
-- Build from the **Dockerfile** (recommended).
-- Set **port** to **8080** (or align with `PORT`).
-- Configure secrets: `CLIENT_ID_BDB`, `CLIENT_SECRET_BDB`, `MCP_REQUEST_HEADERS`.
+### Managed Python 3.11 (Fusion) — source repo
 
-MCP clients must include header `MCP_REQUEST_HEADERS: <same value as env>` on requests to your App Runner URL.
+The Fusion builder runs **`sh start.sh` during the image build**. The repo includes **`start.sh`** (dependency install only) so that step succeeds. The process that listens on the port must be set separately:
+
+- Prefer **`apprunner.yaml`** in this repo (`run.command: python3 mcp_server.py`, port **8080**).
+- If you use **Configure all settings here** and **ignore** `apprunner.yaml`, set **Start command** to `python3 mcp_server.py` (not only `sh start.sh`, or the container would install deps and exit).
+
+Environment variables / secrets: `CLIENT_ID_BDB`, `CLIENT_SECRET_BDB`, `MCP_REQUEST_HEADERS`.
+
+### Container image (Dockerfile)
+
+Build from the **Dockerfile** instead if you want a single image definition; set **port** **8080** (or match `PORT`).
+
+MCP clients must send header `MCP_REQUEST_HEADERS: <same value as env>` when that env var is set.
 
 ## Security notes
 

@@ -67,28 +67,31 @@ The activity-service validates **`structuredContent.result`** against the tool *
 
 **Functional difference:** Address MCP calls **WxCC APIs** with a bearer token from the agent. This MCP calls **`scripts.cisco.com`** (Cisco BDB job). A **`403 Forbidden`** there is an **upstream Cisco script / network / entitlement** issue, not the same code path as Address MCP.
 
-### Application logs in App Runner (CloudWatch)
+### Application logs in App Runner and CloudWatch
 
-App Runner sends **stdout and stderr** from your process to CloudWatch. This server writes logs and the startup banner to **stderr** (same as most container runtimes). This is **not** the same stream as **deployment** or **service** logs.
+Messages such as `POST /mcp`, `CallToolRequest`, and `INFO: … uvicorn` are **runtime application logs**. They are stored in CloudWatch under the **`application`** log group for your service — **not** in streams whose names start with **`deployment/`** (those are build/deploy logs).
 
-| What you see | Where it lives |
-|----------------|----------------|
-| Build output (`[Build]`, pip, errors) | **Deployment** logs / Service log group — stream names like `deployment/…` |
-| App Runner platform messages | **Service** log group — stream `events` |
-| **`print()`, Python `logging`, uvicorn** | **Application** log group — streams like `instance/…` |
+| Log group name ends with | What you get |
+|--------------------------|--------------|
+| **`…/service`** | Platform + **deployment/build** output (`deployment/…` streams, `[Build]` lines) |
+| **`…/application`** | **Running container**: uvicorn, MCP SDK, logger **`cisco_ai_docs_mcp`** |
 
-**In the console:** open your service → **Logs** tab → section **Application logs** (not only *Deployment logs*).  
-**In CloudWatch:** log group name pattern:
+Official reference: [Viewing App Runner logs in CloudWatch](https://docs.aws.amazon.com/apprunner/latest/dg/monitor-cwl.html).
 
-`/aws/apprunner/<service-name>/<service-id>/application`
+**App Runner console:** your service → **Logs** → section **Application logs** → open stream **`instance/…`**. Use **View in CloudWatch** when available.
 
-Official detail: [Viewing App Runner logs in CloudWatch](https://docs.aws.amazon.com/apprunner/latest/dg/monitor-cwl.html).
+**CloudWatch console:** **Logs** → **Log groups** → **`/aws/apprunner/<service-name>/<service-id>/application`** (correct **Region**).
 
-**If application logs are empty or delayed:**
+**CloudWatch Logs Insights** (search across streams): **Logs** → **Logs Insights** → select the **`application`** log group:
 
-1. Set **`PYTHONUNBUFFERED=1`** for the runtime (this repo sets it in **`apprunner.yaml`** and **`run.sh`**). If you use **Configure all settings here** instead of the YAML file, add that variable manually in **Runtime environment variables**.
-2. Confirm the container stays healthy (TCP health check passes) — a crashing process may produce little or no application output.
-3. Open **CloudWatch → Log groups** and select the **`…/application`** group, not only **`…/service`**.
+```sql
+fields @timestamp, @message
+| filter @message like /POST \/mcp|CallToolRequest|cisco_ai_docs_mcp/
+| sort @timestamp desc
+| limit 200
+```
+
+**If `application` appears empty:** set **`PYTHONUNBUFFERED=1`** at runtime (see **`apprunner.yaml`**), confirm the service is **Running**, and verify you opened **`…/application`** rather than only **`…/service`**.
 
 ### Container image (Dockerfile)
 

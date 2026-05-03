@@ -30,7 +30,9 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 
-logger = logging.getLogger(__name__)
+# Stable name so CloudWatch Logs Insights can filter `@message like /cisco_ai_docs_mcp/`
+# regardless of whether the app is run as `python mcp_server.py` (__main__) or as a module.
+logger = logging.getLogger("cisco_ai_docs_mcp")
 
 _DEFAULT_TOKEN_URL = (
     "https://sso-dbbfec7f.sso.duosecurity.com/oauth/DID1LHEMWQZDEGZ7FAXX/token"

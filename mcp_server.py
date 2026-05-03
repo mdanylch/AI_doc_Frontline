@@ -108,14 +108,14 @@ def get_settings() -> Settings:
 
 
 def _configure_logging(settings: Settings) -> None:
-    """Stdout logging for App Runner / CloudWatch; levels from LOG_LEVEL."""
+    """Stderr logging for App Runner / CloudWatch (common convention); levels from LOG_LEVEL."""
     level_name = (settings.log_level or "INFO").upper().strip()
     level = getattr(logging, level_name, logging.INFO)
 
     root = logging.getLogger()
     root.setLevel(level)
     if not root.handlers:
-        handler = logging.StreamHandler(sys.stdout)
+        handler = logging.StreamHandler(sys.stderr)
         handler.setFormatter(
             logging.Formatter(
                 "%(asctime)s %(levelname)s [%(name)s] %(message)s",
@@ -140,6 +140,16 @@ def _sanitize_one_line(s: str, max_len: int = 400) -> str:
     if len(out) > max_len:
         return out[:max_len] + "..."
     return out
+
+
+def _tool_wrap(payload: object) -> dict[str, str]:
+    """
+    Webex / WxCC MCP validates structured tool output with a required ``result`` field.
+    FastMCP sends dict returns as structuredContent (see fastmcp Tool.convert_result).
+    """
+    if isinstance(payload, str):
+        return {"result": payload}
+    return {"result": json.dumps(payload)}
 
 
 def _requests_verify(settings: Settings) -> bool | str:
@@ -223,7 +233,7 @@ mcp = FastMCP(name="cisco-ai-docs")
 
 
 @mcp.tool()
-def cisco_docs_query(query: str) -> str:
+def cisco_docs_query(query: str) -> dict[str, str]:
     """
     Query Cisco documentation using the Mykola_Cisco_Docs BDB script job.
 
@@ -231,7 +241,7 @@ def cisco_docs_query(query: str) -> str:
         query: Question or search terms from the MCP client.
 
     Returns:
-        JSON string with the script API response body or structured error information.
+        Object with key ``result`` (stringified JSON) for WxCC/Webex tool validation.
     """
     settings = get_settings()
     correlation_id = str(uuid.uuid4())
@@ -250,7 +260,7 @@ def cisco_docs_query(query: str) -> str:
             "tool_cisco_docs_query_reject correlation_id=%s reason=empty_query",
             correlation_id,
         )
-        return json.dumps({"error": "query must not be empty"})
+        return _tool_wrap({"error": "query must not be empty"})
 
     try:
         token = fetch_client_credentials_token(settings, correlation_id=correlation_id)
@@ -258,15 +268,16 @@ def cisco_docs_query(query: str) -> str:
         text = ""
         if e.response is not None:
             text = (e.response.text or "")[:_MAX_ERROR_BODY_CHARS]
+        sc = getattr(e.response, "status_code", None) if e.response is not None else None
         logger.warning(
             "tool_cisco_docs_query_oauth_failed correlation_id=%s status=%s",
             correlation_id,
-            e.response.status_code if e.response else None,
+            sc,
         )
-        return json.dumps(
+        return _tool_wrap(
             {
                 "error": "Failed to obtain OAuth token",
-                "status_code": e.response.status_code if e.response else None,
+                "status_code": sc,
                 "detail": text,
             }
         )
@@ -276,14 +287,14 @@ def cisco_docs_query(query: str) -> str:
             correlation_id,
             _sanitize_one_line(str(e), 300),
         )
-        return json.dumps({"error": "OAuth token request failed", "message": str(e)})
+        return _tool_wrap({"error": "OAuth token request failed", "message": str(e)})
     except RuntimeError as e:
         logger.error(
             "tool_cisco_docs_query_oauth_runtime correlation_id=%s error=%s",
             correlation_id,
             _sanitize_one_line(str(e), 300),
         )
-        return json.dumps({"error": str(e)})
+        return _tool_wrap({"error": str(e)})
 
     body = {"dev": "true", "input": {"query": q}}
 
@@ -323,30 +334,38 @@ def cisco_docs_query(query: str) -> str:
                 correlation_id,
                 elapsed_ms,
             )
-            return json.dumps(r.json())
+            return _tool_wrap(r.json())
         except ValueError:
             logger.info(
                 "tool_cisco_docs_query_success correlation_id=%s elapsed_ms=%s result=non_json_text",
                 correlation_id,
                 elapsed_ms,
             )
-            return json.dumps({"raw_text": (r.text or "")[:_MAX_ERROR_BODY_CHARS]})
+            return _tool_wrap({"raw_text": (r.text or "")[:_MAX_ERROR_BODY_CHARS]})
 
     except requests.HTTPError as e:
         text = ""
         if e.response is not None:
             text = (e.response.text or "")[:_MAX_ERROR_BODY_CHARS]
         elapsed_ms = int((time.perf_counter() - t_script) * 1000)
+        sc = getattr(e.response, "status_code", None) if e.response is not None else None
         logger.warning(
-            "cisco_script_http_error correlation_id=%s status=%s elapsed_ms=%s",
+            "cisco_script_http_error correlation_id=%s status=%s elapsed_ms=%s detail_prefix=%s",
             correlation_id,
-            e.response.status_code if e.response else None,
+            sc,
             elapsed_ms,
+            _sanitize_one_line(text, 120),
         )
-        return json.dumps(
+        if sc == 403:
+            logger.warning(
+                "cisco_script_403_hint correlation_id=%s "
+                "upstream may block cloud egress or deny token/job scope; check Cisco scripts access",
+                correlation_id,
+            )
+        return _tool_wrap(
             {
                 "error": "Cisco script job HTTP error",
-                "status_code": e.response.status_code if e.response else None,
+                "status_code": sc,
                 "detail": text,
             }
         )
@@ -358,7 +377,7 @@ def cisco_docs_query(query: str) -> str:
             elapsed_ms,
             _sanitize_one_line(str(e), 300),
         )
-        return json.dumps({"error": "Cisco script request failed", "message": str(e)})
+        return _tool_wrap({"error": "Cisco script request failed", "message": str(e)})
 
 
 class HttpAccessLogMiddleware(BaseHTTPMiddleware):
@@ -445,8 +464,8 @@ async def health_check(request: Request) -> Response:
 
 
 def main() -> None:
-    # Raw stdout line so CloudWatch "application" logs show activity even if logging setup fails.
-    print("[cisco-ai-docs-mcp] process start", flush=True)
+    # Banner on stderr so container log collectors pick it up (same stream as logging).
+    print("[cisco-ai-docs-mcp] process start", file=sys.stderr, flush=True)
     settings = get_settings()
     _configure_logging(settings)
 

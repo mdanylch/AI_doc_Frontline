@@ -59,9 +59,13 @@ OAuth env vars on App Runner may be lowercase **`client_id`** and **`client_secr
 
 If **Configuration source** is **API**, you can use **`apprunner.yaml`** in the repo (same commands as above).
 
+### WxCC / Webex tool output shape
+
+The virtual agent runtime validates MCP tool results against an output schema that includes a required **`result`** field. This server returns a **dict** `{"result": "<JSON string>"}` so **`structuredContent.result`** is populated. Older versions returned only text and triggered warnings such as *Required fields missing in tool result: result*.
+
 ### Application logs in App Runner (CloudWatch)
 
-App Runner sends **stdout and stderr** from your process to CloudWatch. This is **not** the same stream as **deployment** or **service** logs.
+App Runner sends **stdout and stderr** from your process to CloudWatch. This server writes logs and the startup banner to **stderr** (same as most container runtimes). This is **not** the same stream as **deployment** or **service** logs.
 
 | What you see | Where it lives |
 |----------------|----------------|
@@ -87,6 +91,10 @@ Official detail: [Viewing App Runner logs in CloudWatch](https://docs.aws.amazon
 Build from the **Dockerfile** instead if you want a single image definition; set **port** **8080** (or match `PORT`).
 
 MCP clients must send header `MCP_REQUEST_HEADERS: <same value as env>` when that env var is set.
+
+### Cisco `scripts.cisco.com` returns 403 Forbidden
+
+If tool results contain HTML *403 Forbidden* from `https://scripts.cisco.com/...`, OAuth may still be working; the **script job** or **network path** is denied. Common causes: job name/access policy, IP/reputation rules on Cisco’s side, or egress restrictions. Work with your Cisco/BDB admin to allow the App Runner NAT addresses or to confirm the OAuth token is authorized for job **`Mykola_Cisco_Docs`**.
 
 ## Security notes
 

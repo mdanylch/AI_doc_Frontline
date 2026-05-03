@@ -50,7 +50,7 @@ MCP endpoint: `http://localhost:8080/mcp` (streamable HTTP)
 | **Start command** | `sh run.sh` |
 | **Port** | `8080` |
 
-**`start.sh`** installs dependencies only (build phase). **`run.sh`** starts `python3 mcp_server.py` with **`PORT`** (App Runner sets **8080**).
+**`start.sh`** installs dependencies into **`/app/vendor`** (build phase). AWS Fusion’s runtime image only copies the **`/app`** tree from the build stage, so global `pip install` during build does not appear in the container that runs your app—vendor installs avoid that. **`run.sh`** sets **`PYTHONPATH`** to include `/app/vendor`, then starts `python3 mcp_server.py` with **`PORT`** (App Runner sets **8080**).
 
 OAuth env vars on App Runner may be lowercase **`client_id`** and **`client_secret`**; those names are supported.
 

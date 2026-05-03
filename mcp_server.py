@@ -17,9 +17,12 @@ import logging
 import sys
 import time
 import uuid
+from typing import Any
 
 import requests
 from fastmcp import FastMCP
+from fastmcp.tools.base import ToolResult
+from mcp.types import TextContent
 from pydantic import AliasChoices, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from starlette.middleware import Middleware
@@ -142,14 +145,30 @@ def _sanitize_one_line(s: str, max_len: int = 400) -> str:
     return out
 
 
-def _tool_wrap(payload: object) -> dict[str, str]:
+def _tool_result(payload: object) -> ToolResult:
     """
-    Webex / WxCC MCP validates structured tool output with a required ``result`` field.
-    FastMCP sends dict returns as structuredContent (see fastmcp Tool.convert_result).
+    WxCC activity-service validates ``structuredContent.result``. A plain dict return is not
+    always wired the same as ``CallToolResult.structuredContent`` on all MCP clients.
+    Returning ``ToolResult`` sets both **content** (text) and **structured_content** explicitly.
     """
-    if isinstance(payload, str):
-        return {"result": payload}
-    return {"result": json.dumps(payload)}
+    body = payload if isinstance(payload, str) else json.dumps(payload)
+    return ToolResult(
+        content=[TextContent(type="text", text=body)],
+        structured_content={"result": body},
+    )
+
+
+# Advertised in tools/list so WxCC validation matches runtime output.
+CISCO_DOCS_QUERY_OUTPUT_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "result": {
+            "type": "string",
+            "description": "JSON-encoded docs payload or error object from Cisco script job.",
+        },
+    },
+    "required": ["result"],
+}
 
 
 def _requests_verify(settings: Settings) -> bool | str:
@@ -232,8 +251,8 @@ def fetch_client_credentials_token(settings: Settings, *, correlation_id: str) -
 mcp = FastMCP(name="cisco-ai-docs")
 
 
-@mcp.tool()
-def cisco_docs_query(query: str) -> dict[str, str]:
+@mcp.tool(output_schema=CISCO_DOCS_QUERY_OUTPUT_SCHEMA)
+def cisco_docs_query(query: str) -> ToolResult:
     """
     Query Cisco documentation using the Mykola_Cisco_Docs BDB script job.
 
@@ -241,7 +260,7 @@ def cisco_docs_query(query: str) -> dict[str, str]:
         query: Question or search terms from the MCP client.
 
     Returns:
-        Object with key ``result`` (stringified JSON) for WxCC/Webex tool validation.
+        MCP tool result with ``structuredContent.result`` (JSON string) per WxCC output schema.
     """
     settings = get_settings()
     correlation_id = str(uuid.uuid4())
@@ -260,7 +279,7 @@ def cisco_docs_query(query: str) -> dict[str, str]:
             "tool_cisco_docs_query_reject correlation_id=%s reason=empty_query",
             correlation_id,
         )
-        return _tool_wrap({"error": "query must not be empty"})
+        return _tool_result({"error": "query must not be empty"})
 
     try:
         token = fetch_client_credentials_token(settings, correlation_id=correlation_id)
@@ -274,7 +293,7 @@ def cisco_docs_query(query: str) -> dict[str, str]:
             correlation_id,
             sc,
         )
-        return _tool_wrap(
+        return _tool_result(
             {
                 "error": "Failed to obtain OAuth token",
                 "status_code": sc,
@@ -287,14 +306,14 @@ def cisco_docs_query(query: str) -> dict[str, str]:
             correlation_id,
             _sanitize_one_line(str(e), 300),
         )
-        return _tool_wrap({"error": "OAuth token request failed", "message": str(e)})
+        return _tool_result({"error": "OAuth token request failed", "message": str(e)})
     except RuntimeError as e:
         logger.error(
             "tool_cisco_docs_query_oauth_runtime correlation_id=%s error=%s",
             correlation_id,
             _sanitize_one_line(str(e), 300),
         )
-        return _tool_wrap({"error": str(e)})
+        return _tool_result({"error": str(e)})
 
     body = {"dev": "true", "input": {"query": q}}
 
@@ -334,14 +353,14 @@ def cisco_docs_query(query: str) -> dict[str, str]:
                 correlation_id,
                 elapsed_ms,
             )
-            return _tool_wrap(r.json())
+            return _tool_result(r.json())
         except ValueError:
             logger.info(
                 "tool_cisco_docs_query_success correlation_id=%s elapsed_ms=%s result=non_json_text",
                 correlation_id,
                 elapsed_ms,
             )
-            return _tool_wrap({"raw_text": (r.text or "")[:_MAX_ERROR_BODY_CHARS]})
+            return _tool_result({"raw_text": (r.text or "")[:_MAX_ERROR_BODY_CHARS]})
 
     except requests.HTTPError as e:
         text = ""
@@ -362,7 +381,7 @@ def cisco_docs_query(query: str) -> dict[str, str]:
                 "upstream may block cloud egress or deny token/job scope; check Cisco scripts access",
                 correlation_id,
             )
-        return _tool_wrap(
+        return _tool_result(
             {
                 "error": "Cisco script job HTTP error",
                 "status_code": sc,
@@ -377,7 +396,7 @@ def cisco_docs_query(query: str) -> dict[str, str]:
             elapsed_ms,
             _sanitize_one_line(str(e), 300),
         )
-        return _tool_wrap({"error": "Cisco script request failed", "message": str(e)})
+        return _tool_result({"error": "Cisco script request failed", "message": str(e)})
 
 
 class HttpAccessLogMiddleware(BaseHTTPMiddleware):

@@ -61,7 +61,11 @@ If **Configuration source** is **API**, you can use **`apprunner.yaml`** in the 
 
 ### WxCC / Webex tool output shape
 
-The virtual agent runtime validates MCP tool results against an output schema that includes a required **`result`** field. This server returns a **dict** `{"result": "<JSON string>"}` so **`structuredContent.result`** is populated. Older versions returned only text and triggered warnings such as *Required fields missing in tool result: result*.
+The activity-service validates **`structuredContent.result`** against the tool **output schema**. This server returns FastMCP **`ToolResult`** with explicit **`structured_content={"result": "<JSON string>"}`** and **`output_schema`** on `cisco_docs_query`, so the MCP **`CallToolResult`** carries structured output the same way WxCC expects.
+
+**Why Address_MCP (`address_book`) can look “simpler”:** that tool returns a **plain string**. Your VA integration often **does not attach a strict output schema** to that MCP tool, so WxCC only checks text content. The docs integration is typically configured with a schema that **requires `result`**, so this server must populate structured content explicitly.
+
+**Functional difference:** Address MCP calls **WxCC APIs** with a bearer token from the agent. This MCP calls **`scripts.cisco.com`** (Cisco BDB job). A **`403 Forbidden`** there is an **upstream Cisco script / network / entitlement** issue, not the same code path as Address MCP.
 
 ### Application logs in App Runner (CloudWatch)
 

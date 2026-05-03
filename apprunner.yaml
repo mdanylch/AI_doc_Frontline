@@ -1,8 +1,8 @@
 # AWS App Runner — Python 3.11 managed runtime (Fusion).
-# Fusion's build invokes `start.sh` during the image build; keep that script limited to
-# dependency installation. The MCP server is started via `run.command` below.
-#
-# If you use "Configure all settings here" in the console, mirror these commands manually.
+# Console mirror (Configuration source: API):
+#   Build command:  sh start.sh
+#   Start command:  sh run.sh
+#   Port:           8080
 
 version: 1.0
 runtime: python311
@@ -10,11 +10,10 @@ runtime: python311
 build:
   commands:
     build:
-      - python3 -m pip install --upgrade pip setuptools wheel
-      - pip3 install --no-cache-dir -r requirements.txt
+      - sh start.sh
 
 run:
   runtime-version: "3.11"
-  command: python3 mcp_server.py
+  command: sh run.sh
   network:
     port: 8080

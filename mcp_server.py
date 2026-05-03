@@ -5,8 +5,8 @@ MCP server: Cisco docs via BDB script job (Mykola_Cisco_Docs).
 - HTTP clients must send header ``MCP_REQUEST_HEADERS`` matching the env var of the same name
   when that env var is set (AWS App Runner shared secret pattern).
 
-Secrets (CLIENT_ID_BDB, CLIENT_SECRET_BDB, MCP_REQUEST_HEADERS) come only from environment —
-never commit real values.
+Secrets come only from environment (see aliases below, including App Runner names
+``client_id`` / ``client_secret``). Never commit real values.
 """
 
 from __future__ import annotations
@@ -48,10 +48,18 @@ class Settings(BaseSettings):
     )
 
     client_id_bdb: str = Field(
-        validation_alias=AliasChoices("CLIENT_ID_BDB", "CLIENT_ID"),
+        validation_alias=AliasChoices(
+            "CLIENT_ID_BDB",
+            "CLIENT_ID",
+            "client_id",
+        ),
     )
     client_secret_bdb: str = Field(
-        validation_alias=AliasChoices("CLIENT_SECRET_BDB", "CLIENT_SECRET"),
+        validation_alias=AliasChoices(
+            "CLIENT_SECRET_BDB",
+            "CLIENT_SECRET",
+            "client_secret",
+        ),
     )
 
     bdb_token_url: str = Field(default=_DEFAULT_TOKEN_URL, validation_alias="BDB_TOKEN_URL")

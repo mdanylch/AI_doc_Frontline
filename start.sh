@@ -1,10 +1,8 @@
 #!/bin/sh
-# AWS App Runner / Fusion Python build: this script is executed during `docker build`
-# (`RUN sh start.sh`). It must finish quickly — install deps only. Do not start the MCP
-# server here or the build will hang or fail.
+# App Runner build command: `sh start.sh`
+# Install deps only — must exit during image build (do not start the server here).
 #
-# At runtime, use apprunner.yaml `run.command` or the console start command:
-#   python3 mcp_server.py
+# App Runner start command: `sh run.sh` (see run.sh).
 set -e
 python3 -m pip install --upgrade pip setuptools wheel 2>/dev/null || true
 pip3 install --no-cache-dir -r requirements.txt

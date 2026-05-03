@@ -17,8 +17,8 @@ FastMCP server (**streamable HTTP**) that:
 
 | Variable | Required | Description |
 |----------|----------|-------------|
-| `CLIENT_ID_BDB` | Yes | Duo OAuth client id |
-| `CLIENT_SECRET_BDB` | Yes | Duo OAuth client secret |
+| OAuth client id | Yes | `CLIENT_ID_BDB`, `CLIENT_ID`, or **`client_id`** (App Runner) |
+| OAuth client secret | Yes | `CLIENT_SECRET_BDB`, `CLIENT_SECRET`, or **`client_secret`** (App Runner) |
 | `MCP_REQUEST_HEADERS` | Recommended (prod) | Shared secret; clients must send this value in the **HTTP header** `MCP_REQUEST_HEADERS` |
 | `BDB_TOKEN_URL` | No | Defaults to Duo token endpoint in code |
 | `CISCO_SCRIPT_JOB_URL` | No | Defaults to `https://scripts.cisco.com/api/v2/jobs/Mykola_Cisco_Docs` |
@@ -42,14 +42,19 @@ MCP endpoint: `http://localhost:8080/mcp` (streamable HTTP)
 
 ## AWS App Runner
 
-### Managed Python 3.11 (Fusion) — source repo
+### Managed Python 3.11 — matches Address_MCP style
 
-The Fusion builder runs **`sh start.sh` during the image build**. The repo includes **`start.sh`** (dependency install only) so that step succeeds. The process that listens on the port must be set separately:
+| Setting | Value |
+|--------|--------|
+| **Build command** | `sh start.sh` |
+| **Start command** | `sh run.sh` |
+| **Port** | `8080` |
 
-- Prefer **`apprunner.yaml`** in this repo (`run.command: python3 mcp_server.py`, port **8080**).
-- If you use **Configure all settings here** and **ignore** `apprunner.yaml`, set **Start command** to `python3 mcp_server.py` (not only `sh start.sh`, or the container would install deps and exit).
+**`start.sh`** installs dependencies only (build phase). **`run.sh`** starts `python3 mcp_server.py` with **`PORT`** (App Runner sets **8080**).
 
-Environment variables / secrets: `CLIENT_ID_BDB`, `CLIENT_SECRET_BDB`, `MCP_REQUEST_HEADERS`.
+OAuth env vars on App Runner may be lowercase **`client_id`** and **`client_secret`**; those names are supported.
+
+If **Configuration source** is **API**, you can use **`apprunner.yaml`** in the repo (same commands as above).
 
 ### Container image (Dockerfile)
 

@@ -14,16 +14,17 @@ from __future__ import annotations
 import hmac
 import json
 import logging
+import os
 import sys
 import time
 import uuid
-from typing import Any
+from typing import Any, Self
 
 import requests
 from fastmcp import FastMCP
 from fastmcp.tools.base import ToolResult
 from mcp.types import TextContent
-from pydantic import AliasChoices, Field, field_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from starlette.middleware import Middleware
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -51,20 +52,67 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
-    client_id_bdb: str = Field(
-        validation_alias=AliasChoices(
+    #: Resolved from CLIENT_ID_BDB, CLIENT_ID, or client_id (env / .env).
+    client_id_bdb: str = Field(default="")
+    #: Resolved from CLIENT_SECRET_BDB, CLIENT_SECRET, or client_secret (env / .env).
+    client_secret_bdb: str = Field(default="")
+
+    @model_validator(mode="before")
+    @classmethod
+    def _merge_oauth_env_aliases(cls, data: Any) -> dict[str, Any]:
+        """pydantic-settings only maps env names derived from the field name; accept all aliases."""
+        merged: dict[str, Any] = dict(data) if isinstance(data, dict) else {}
+
+        def pick(*candidates: str) -> str | None:
+            for key in candidates:
+                if key in merged:
+                    val = merged.get(key)
+                    if val is not None and str(val).strip() != "":
+                        return str(val).strip()
+            for key in candidates:
+                val = os.environ.get(key)
+                if val is not None and str(val).strip() != "":
+                    return str(val).strip()
+            upper_map = {k.upper(): v for k, v in os.environ.items()}
+            for key in candidates:
+                val = upper_map.get(key.upper())
+                if val is not None and str(val).strip() != "":
+                    return str(val).strip()
+            return None
+
+        cid = pick(
+            "client_id_bdb",
             "CLIENT_ID_BDB",
             "CLIENT_ID",
             "client_id",
-        ),
-    )
-    client_secret_bdb: str = Field(
-        validation_alias=AliasChoices(
+        )
+        if cid:
+            merged["client_id_bdb"] = cid
+
+        csec = pick(
+            "client_secret_bdb",
             "CLIENT_SECRET_BDB",
             "CLIENT_SECRET",
             "client_secret",
-        ),
-    )
+        )
+        if csec:
+            merged["client_secret_bdb"] = csec
+
+        return merged
+
+    @model_validator(mode="after")
+    def _oauth_credentials_required(self) -> Self:
+        if not self.client_id_bdb.strip():
+            raise ValueError(
+                "Missing OAuth client id. Set CLIENT_ID_BDB, CLIENT_ID, or client_id "
+                "(environment variables or a .env file in this directory)."
+            )
+        if not self.client_secret_bdb.strip():
+            raise ValueError(
+                "Missing OAuth client secret. Set CLIENT_SECRET_BDB, CLIENT_SECRET, or client_secret "
+                "(environment variables or a .env file in this directory)."
+            )
+        return self
 
     bdb_token_url: str = Field(default=_DEFAULT_TOKEN_URL, validation_alias="BDB_TOKEN_URL")
     cisco_script_job_url: str = Field(
@@ -234,20 +282,21 @@ def outbound_api_call(
             _sanitize_one_line(str(e), 240),
         )
         raise
-        elapsed_ms = int((time.perf_counter() - t0) * 1000)
-        oc = _http_outcome_from_status(r.status_code)
-        logger.info(
-            "app_event kind=outbound_http phase=complete purpose=%s outcome=%s http_status=%s "
-            "http_outcome=%s elapsed_ms=%s correlation_id=%s response_bytes=%s",
-            purpose,
-            "http_success" if r.ok else "http_non_success",
-            r.status_code,
-            oc,
-            elapsed_ms,
-            correlation_id,
-            len(r.content or b""),
-        )
-        return r
+
+    elapsed_ms = int((time.perf_counter() - t0) * 1000)
+    oc = _http_outcome_from_status(r.status_code)
+    logger.info(
+        "app_event kind=outbound_http phase=complete purpose=%s outcome=%s http_status=%s "
+        "http_outcome=%s elapsed_ms=%s correlation_id=%s response_bytes=%s",
+        purpose,
+        "http_success" if r.ok else "http_non_success",
+        r.status_code,
+        oc,
+        elapsed_ms,
+        correlation_id,
+        len(r.content or b""),
+    )
+    return r
 
 
 def fetch_client_credentials_token(settings: Settings, *, correlation_id: str) -> str:

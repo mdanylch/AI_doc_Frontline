@@ -2,26 +2,27 @@
 
 FastMCP server (**streamable HTTP**) that:
 
-1. Obtains a **new Duo OAuth access token** (`client_credentials`) on **each** `cisco_docs_query` tool call.
-2. Calls the Cisco BDB script job **`Mykola_Cisco_Docs`** with `Authorization: Bearer <token>` and body  
-   `{"dev":"true","input":{"query":"<your query>"}}`.
+1. On each **`cisco_docs_query`** tool call, **POST**s to Cisco **Docs AI**  
+   `https://docs-ai-ext.cloudapps.cisco.com/api/v1/docs/ask` with  
+   `Authorization: Bearer <docai_token>` and JSON body `{"question":"<query>"}`.
+2. **Voice mode (default):** prepends a short instruction so answers stay in **3–4 sentences**, then strips URLs and citation-style noise from the model reply before returning it to the client.
 3. Optionally requires HTTP header **`MCP_REQUEST_HEADERS`** to match the environment variable of the same name (same pattern as other App Runner MCP deployments).
 
 ## Tool
 
 | Name | Description |
 |------|-------------|
-| `cisco_docs_query` | Pass natural-language `query`; returns JSON from the script API. |
+| `cisco_docs_query` | Pass natural-language `query`; returns JSON with **`answer`**, **`confidence`**, and **`voice_optimized`** (set `VOICE_OPTIMIZED=false` for raw answer + `sources`). |
 
 ## Environment variables
 
 | Variable | Required | Description |
 |----------|----------|-------------|
-| OAuth client id | Yes | `CLIENT_ID_BDB`, `CLIENT_ID`, or **`client_id`** (App Runner) |
-| OAuth client secret | Yes | `CLIENT_SECRET_BDB`, `CLIENT_SECRET`, or **`client_secret`** (App Runner) |
+| **`docai_token`** (or `DOC_AI_TOKEN`) | Yes | Bearer token for Docs AI (`Authorization: Bearer …`) |
+| `DOCS_AI_ASK_URL` | No | Default `https://docs-ai-ext.cloudapps.cisco.com/api/v1/docs/ask` |
 | `MCP_REQUEST_HEADERS` | Recommended (prod) | Shared secret; clients must send this value in the **HTTP header** `MCP_REQUEST_HEADERS` |
-| `BDB_TOKEN_URL` | No | Defaults to Duo token endpoint in code |
-| `CISCO_SCRIPT_JOB_URL` | No | Defaults to `https://scripts.cisco.com/api/v2/jobs/Mykola_Cisco_Docs` |
+| `VOICE_OPTIMIZED` | No | Default `true` — voice prompt + post-processed answer |
+| `VOICE_MAX_SENTENCES` | No | Default `4` — cap on sentences when `VOICE_OPTIMIZED=true` |
 | `PORT` | No | Default `8080` (App Runner sets this) |
 | `HTTP_SSL_VERIFY` / `SSL_CA_BUNDLE` | No | Corporate TLS overrides |
 | `LOG_LEVEL` | No | `DEBUG`, `INFO` (default), `WARNING`, … — controls verbosity |
@@ -34,8 +35,7 @@ Copy `env.example` to `.env` for local runs (never commit `.env`).
 
 ```bash
 pip install -r requirements.txt
-set CLIENT_ID_BDB=...
-set CLIENT_SECRET_BDB=...
+set docai_token=your-docs-ai-bearer-token
 set MCP_REQUEST_HEADERS=your-shared-secret   # optional for local testing
 python mcp_server.py
 ```
@@ -55,7 +55,7 @@ MCP endpoint: `http://localhost:8080/mcp` (streamable HTTP)
 
 **`start.sh`** installs dependencies into **`/app/vendor`** (build phase). AWS Fusion’s runtime image only copies the **`/app`** tree from the build stage, so global `pip install` during build does not appear in the container that runs your app—vendor installs avoid that. **`run.sh`** sets **`PYTHONPATH`** to include `/app/vendor`, then starts `python3 mcp_server.py` with **`PORT`** (App Runner sets **8080**).
 
-OAuth env vars on App Runner may be lowercase **`client_id`** and **`client_secret`**; those names are supported.
+Configure **`docai_token`** (and optionally **`MCP_REQUEST_HEADERS`**) in App Runner **environment variables** or secrets.
 
 If **Configuration source** is **API**, you can use **`apprunner.yaml`** in the repo (same commands as above).
 
@@ -65,7 +65,7 @@ The activity-service validates **`structuredContent.result`** against the tool *
 
 **Why Address_MCP (`address_book`) can look “simpler”:** that tool returns a **plain string**. Your VA integration often **does not attach a strict output schema** to that MCP tool, so WxCC only checks text content. The docs integration is typically configured with a schema that **requires `result`**, so this server must populate structured content explicitly.
 
-**Functional difference:** Address MCP calls **WxCC APIs** with a bearer token from the agent. This MCP calls **`scripts.cisco.com`** (Cisco BDB job). A **`403 Forbidden`** there is an **upstream Cisco script / network / entitlement** issue, not the same code path as Address MCP.
+**Functional difference:** Address MCP calls **WxCC APIs** with a bearer token from the agent. This MCP calls **Cisco Docs AI** (`docs-ai-ext.cloudapps.cisco.com`) using **`docai_token`**. HTTP **`401`/`403`** from Docs AI usually mean an invalid or expired bearer token or entitlement on the Docs AI side.
 
 ### Application logs in App Runner and CloudWatch
 
@@ -99,11 +99,7 @@ Build from the **Dockerfile** instead if you want a single image definition; set
 
 MCP clients must send header `MCP_REQUEST_HEADERS: <same value as env>` when that env var is set.
 
-### Cisco `scripts.cisco.com` returns 403 Forbidden
-
-If tool results contain HTML *403 Forbidden* from `https://scripts.cisco.com/...`, OAuth may still be working; the **script job** or **network path** is denied. Common causes: job name/access policy, IP/reputation rules on Cisco’s side, or egress restrictions. Work with your Cisco/BDB admin to allow the App Runner NAT addresses or to confirm the OAuth token is authorized for job **`Mykola_Cisco_Docs`**.
-
 ## Security notes
 
-- Do not commit real credentials; use App Runner secrets or Parameter Store.
+- Do not commit real credentials; use App Runner secrets or Parameter Store for **`docai_token`**.
 - `MCP_REQUEST_HEADERS` uses a timing-safe compare when enabled.

@@ -1,12 +1,11 @@
 """
-MCP server: Cisco docs via BDB script job (Mykola_Cisco_Docs).
+MCP server: Cisco Docs AI (streamable HTTP).
 
-- Duo OAuth client_credentials token is fetched fresh on each tool invocation (each docs query).
-- HTTP clients must send header ``MCP_REQUEST_HEADERS`` matching the env var of the same name
-  when that env var is set (AWS App Runner shared secret pattern).
+- Calls Cisco Docs AI ``/api/v1/docs/ask`` with a bearer token from the environment
+  (``docai_token`` / ``DOC_AI_TOKEN``). No BDB or Duo OAuth.
+- Optional HTTP gate: header ``MCP_REQUEST_HEADERS`` must match the env var of the same name.
 
-Secrets come only from environment (see aliases below, including App Runner names
-``client_id`` / ``client_secret``). Never commit real values.
+Secrets: only ``docai_token`` (and optional ``MCP_REQUEST_HEADERS``). Never commit real values.
 """
 
 from __future__ import annotations
@@ -15,6 +14,7 @@ import hmac
 import json
 import logging
 import os
+import re
 import sys
 import time
 import uuid
@@ -24,25 +24,25 @@ import requests
 from fastmcp import FastMCP
 from fastmcp.tools.base import ToolResult
 from mcp.types import TextContent
-from pydantic import Field, field_validator, model_validator
+from pydantic import AliasChoices, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from starlette.middleware import Middleware
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 
-# Stable name so CloudWatch Logs Insights can filter `@message like /cisco_ai_docs_mcp/`
-# regardless of whether the app is run as `python mcp_server.py` (__main__) or as a module.
 logger = logging.getLogger("cisco_ai_docs_mcp")
 
-_DEFAULT_TOKEN_URL = (
-    "https://sso-dbbfec7f.sso.duosecurity.com/oauth/DID1LHEMWQZDEGZ7FAXX/token"
-)
-_DEFAULT_SCRIPT_URL = "https://scripts.cisco.com/api/v2/jobs/Mykola_Cisco_Docs"
-
+_DEFAULT_DOCS_AI_URL = "https://docs-ai-ext.cloudapps.cisco.com/api/v1/docs/ask"
 _HTTP_TIMEOUT_SEC = 120
 _MAX_ERROR_BODY_CHARS = 8000
 _MAX_QUERY_SNIPPET_CHARS = 96
+
+VOICE_REPLY_INSTRUCTION = (
+    "Reply for spoken voice playback only: give exactly 3 to 4 short sentences. "
+    "Use plain language. Do not include URLs, links, document titles in brackets, "
+    "bullet lists, table markup, or citation blocks. End with a period when possible.\n\n"
+)
 
 
 class Settings(BaseSettings):
@@ -52,15 +52,16 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
-    #: Resolved from CLIENT_ID_BDB, CLIENT_ID, or client_id (env / .env).
-    client_id_bdb: str = Field(default="")
-    #: Resolved from CLIENT_SECRET_BDB, CLIENT_SECRET, or client_secret (env / .env).
-    client_secret_bdb: str = Field(default="")
+    docai_token: str = Field(default="", validation_alias=AliasChoices("docai_token", "DOC_AI_TOKEN"))
+
+    docs_ai_ask_url: str = Field(
+        default=_DEFAULT_DOCS_AI_URL,
+        validation_alias=AliasChoices("DOCS_AI_ASK_URL", "docs_ai_ask_url"),
+    )
 
     @model_validator(mode="before")
     @classmethod
-    def _merge_oauth_env_aliases(cls, data: Any) -> dict[str, Any]:
-        """pydantic-settings only maps env names derived from the field name; accept all aliases."""
+    def _merge_docai_token_aliases(cls, data: Any) -> dict[str, Any]:
         merged: dict[str, Any] = dict(data) if isinstance(data, dict) else {}
 
         def pick(*candidates: str) -> str | None:
@@ -80,47 +81,21 @@ class Settings(BaseSettings):
                     return str(val).strip()
             return None
 
-        cid = pick(
-            "client_id_bdb",
-            "CLIENT_ID_BDB",
-            "CLIENT_ID",
-            "client_id",
-        )
-        if cid:
-            merged["client_id_bdb"] = cid
-
-        csec = pick(
-            "client_secret_bdb",
-            "CLIENT_SECRET_BDB",
-            "CLIENT_SECRET",
-            "client_secret",
-        )
-        if csec:
-            merged["client_secret_bdb"] = csec
+        tok = pick("docai_token", "DOC_AI_TOKEN")
+        if tok:
+            merged["docai_token"] = tok
 
         return merged
 
     @model_validator(mode="after")
-    def _oauth_credentials_required(self) -> Self:
-        if not self.client_id_bdb.strip():
+    def _docai_token_required(self) -> Self:
+        if not (self.docai_token or "").strip():
             raise ValueError(
-                "Missing OAuth client id. Set CLIENT_ID_BDB, CLIENT_ID, or client_id "
-                "(environment variables or a .env file in this directory)."
-            )
-        if not self.client_secret_bdb.strip():
-            raise ValueError(
-                "Missing OAuth client secret. Set CLIENT_SECRET_BDB, CLIENT_SECRET, or client_secret "
+                "Missing Docs AI token. Set docai_token or DOC_AI_TOKEN "
                 "(environment variables or a .env file in this directory)."
             )
         return self
 
-    bdb_token_url: str = Field(default=_DEFAULT_TOKEN_URL, validation_alias="BDB_TOKEN_URL")
-    cisco_script_job_url: str = Field(
-        default=_DEFAULT_SCRIPT_URL,
-        validation_alias="CISCO_SCRIPT_JOB_URL",
-    )
-
-    #: When set, every HTTP request must include header ``MCP_REQUEST_HEADERS`` with this exact value.
     mcp_request_headers: str | None = Field(
         default=None,
         validation_alias="MCP_REQUEST_HEADERS",
@@ -133,10 +108,11 @@ class Settings(BaseSettings):
     port: int = Field(default=8080, validation_alias="PORT")
     mcp_path: str = Field(default="/mcp", validation_alias="MCP_PATH")
 
-    #: Logging: DEBUG, INFO, WARNING, ERROR
     log_level: str = Field(default="INFO", validation_alias="LOG_LEVEL")
-    #: If true, log a short sanitized prefix of each docs query (no secrets).
     log_query_snippet: bool = Field(default=True, validation_alias="LOG_QUERY_SNIPPET")
+
+    voice_optimized: bool = Field(default=True, validation_alias="VOICE_OPTIMIZED")
+    voice_max_sentences: int = Field(default=4, ge=1, le=10, validation_alias="VOICE_MAX_SENTENCES")
 
     @field_validator("http_ssl_verify", mode="before")
     @classmethod
@@ -161,7 +137,6 @@ def get_settings() -> Settings:
 
 
 def _configure_logging(settings: Settings) -> None:
-    """Stderr logging for App Runner / CloudWatch (common convention); levels from LOG_LEVEL."""
     level_name = (settings.log_level or "INFO").upper().strip()
     level = getattr(logging, level_name, logging.INFO)
 
@@ -170,13 +145,10 @@ def _configure_logging(settings: Settings) -> None:
     if not root.handlers:
         handler = logging.StreamHandler(sys.stderr)
         handler.setFormatter(
-            logging.Formatter(
-                "%(asctime)s %(levelname)s [%(name)s] %(message)s",
-            )
+            logging.Formatter("%(asctime)s %(levelname)s [%(name)s] %(message)s"),
         )
         root.addHandler(handler)
 
-    # Third-party noise reduction unless DEBUG
     logging.getLogger("urllib3").setLevel(logging.DEBUG if level <= logging.DEBUG else logging.WARNING)
     logging.getLogger("httpx").setLevel(logging.DEBUG if level <= logging.DEBUG else logging.WARNING)
     logging.getLogger("httpcore").setLevel(logging.WARNING)
@@ -186,7 +158,6 @@ def _configure_logging(settings: Settings) -> None:
 
 
 def _sanitize_one_line(s: str, max_len: int = 400) -> str:
-    """Strip control chars / newlines for safe single-line logs (log injection defense)."""
     if not s:
         return ""
     out = s.replace("\r", " ").replace("\n", " ").strip()
@@ -196,11 +167,6 @@ def _sanitize_one_line(s: str, max_len: int = 400) -> str:
 
 
 def _tool_result(payload: object) -> ToolResult:
-    """
-    WxCC activity-service validates ``structuredContent.result``. A plain dict return is not
-    always wired the same as ``CallToolResult.structuredContent`` on all MCP clients.
-    Returning ``ToolResult`` sets both **content** (text) and **structured_content** explicitly.
-    """
     body = payload if isinstance(payload, str) else json.dumps(payload)
     return ToolResult(
         content=[TextContent(type="text", text=body)],
@@ -208,13 +174,12 @@ def _tool_result(payload: object) -> ToolResult:
     )
 
 
-# Advertised in tools/list so WxCC validation matches runtime output.
 CISCO_DOCS_QUERY_OUTPUT_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
         "result": {
             "type": "string",
-            "description": "JSON-encoded docs payload or error object from Cisco script job.",
+            "description": "JSON string: Docs AI answer (voice-sanitized when enabled), confidence, optional fields.",
         },
     },
     "required": ["result"],
@@ -239,56 +204,80 @@ def _http_outcome_from_status(status_code: int | None) -> str:
     return "server_error"
 
 
-def outbound_api_call(
+def _strip_markdown_noise(text: str) -> str:
+    if not text:
+        return ""
+    text = re.sub(r"\[([^\]]+)\]\([^)]*\)", r"\1", text)
+    text = re.sub(r"<https?://[^>\s]+>", "", text)
+    text = re.sub(r"https?://\S+", "", text)
+    text = re.sub(r"\bwww\.[^\s)]+", "", text)
+    text = re.sub(r"`+", "", text)
+    lines_out: list[str] = []
+    for line in text.splitlines():
+        s = line.strip()
+        if not s:
+            continue
+        low = s.lower()
+        if low.startswith("sources:") or low.startswith("**sources"):
+            break
+        if re.match(r"^[\-\*\u2022]\s+", s):
+            s = re.sub(r"^[\-\*\u2022]\s+", "", s)
+        lines_out.append(s)
+    text = " ".join(lines_out)
+    text = re.sub(r"\*{1,2}([^*]+)\*{1,2}", r"\1", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+def _format_answer_for_voice(text: str, max_sentences: int) -> str:
+    text = _strip_markdown_noise(text)
+    chunks = re.split(r"(?<=[.!?])\s+", text)
+    sentences = [c.strip() for c in chunks if c and c.strip()]
+    if not sentences:
+        return text[:500].strip()
+    return " ".join(sentences[:max_sentences]).strip()
+
+
+def _docs_ai_post(
     settings: Settings,
     *,
-    purpose: str,
-    method: str,
-    url: str,
+    question: str,
     correlation_id: str,
-    **kwargs: Any,
 ) -> requests.Response:
-    """
-    Perform an outbound HTTP call and emit uniform ``app_event`` logs (start + complete).
-
-    Never logs secrets, tokens, or request bodies.
-    """
+    url = (settings.docs_ai_ask_url or "").strip() or _DEFAULT_DOCS_AI_URL
     safe_url = _sanitize_one_line(url, 500)
     logger.info(
-        "app_event kind=outbound_http phase=start purpose=%s method=%s url=%s correlation_id=%s",
-        purpose,
-        method.upper(),
+        "app_event kind=outbound_http phase=start purpose=DocsAI_ask method=POST url=%s correlation_id=%s",
         safe_url,
         correlation_id,
     )
     t0 = time.perf_counter()
-    merged: dict[str, Any] = {
-        "timeout": _HTTP_TIMEOUT_SEC,
-        "verify": _requests_verify(settings),
-    }
-    merged.update(kwargs)
     try:
-        r = requests.request(method.upper(), url, **merged)
+        r = requests.post(
+            url,
+            json={"question": question},
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {(settings.docai_token or '').strip()}",
+            },
+            timeout=_HTTP_TIMEOUT_SEC,
+            verify=_requests_verify(settings),
+        )
     except requests.RequestException as e:
         elapsed_ms = int((time.perf_counter() - t0) * 1000)
         logger.warning(
-            "app_event kind=outbound_http phase=complete purpose=%s outcome=network_error "
-            "method=%s url=%s elapsed_ms=%s correlation_id=%s error=%s",
-            purpose,
-            method.upper(),
-            safe_url,
+            "app_event kind=outbound_http phase=complete purpose=DocsAI_ask outcome=network_error "
+            "elapsed_ms=%s correlation_id=%s error=%s",
             elapsed_ms,
             correlation_id,
             _sanitize_one_line(str(e), 240),
         )
         raise
-
     elapsed_ms = int((time.perf_counter() - t0) * 1000)
     oc = _http_outcome_from_status(r.status_code)
     logger.info(
-        "app_event kind=outbound_http phase=complete purpose=%s outcome=%s http_status=%s "
+        "app_event kind=outbound_http phase=complete purpose=DocsAI_ask outcome=%s http_status=%s "
         "http_outcome=%s elapsed_ms=%s correlation_id=%s response_bytes=%s",
-        purpose,
         "http_success" if r.ok else "http_non_success",
         r.status_code,
         oc,
@@ -299,68 +288,16 @@ def outbound_api_call(
     return r
 
 
-def fetch_client_credentials_token(settings: Settings, *, correlation_id: str) -> str:
-    """OAuth 2.0 client_credentials — new access token for this request."""
-    data = {
-        "grant_type": "client_credentials",
-        "client_id": settings.client_id_bdb,
-        "client_secret": settings.client_secret_bdb,
-    }
-    try:
-        r = outbound_api_call(
-            settings,
-            purpose="DuoOAuth_token",
-            method="POST",
-            url=settings.bdb_token_url,
-            correlation_id=correlation_id,
-            data=data,
-            headers={"Content-Type": "application/x-www-form-urlencoded"},
-        )
-        r.raise_for_status()
-        payload = r.json()
-        token = payload.get("access_token")
-        if not token or not isinstance(token, str):
-            logger.error(
-                "app_event kind=oauth_parse outcome=failed reason=missing_access_token "
-                "correlation_id=%s keys=%s",
-                correlation_id,
-                list(payload.keys()) if isinstance(payload, dict) else type(payload).__name__,
-            )
-            raise RuntimeError("Token response missing access_token")
-        logger.info(
-            "app_event kind=oauth_token outcome=success correlation_id=%s access_token_chars=%s",
-            correlation_id,
-            len(token),
-        )
-        return token
-    except requests.HTTPError as e:
-        detail = ""
-        if e.response is not None:
-            detail = _sanitize_one_line((e.response.text or "")[:500])
-        sc = getattr(e.response, "status_code", None) if e.response is not None else None
-        logger.warning(
-            "app_event kind=oauth_token outcome=failed http_status=%s http_outcome=%s "
-            "correlation_id=%s detail=%s",
-            sc,
-            _http_outcome_from_status(sc),
-            correlation_id,
-            detail,
-        )
-        raise
-    except requests.RequestException:
-        raise
-
-
 mcp = FastMCP(name="cisco-ai-docs")
 
 
 @mcp.tool(output_schema=CISCO_DOCS_QUERY_OUTPUT_SCHEMA)
 def cisco_docs_query(query: str) -> ToolResult:
     """
-    Query Cisco documentation using the Mykola_Cisco_Docs BDB script job.
+    Query Cisco documentation via Docs AI (voice-friendly summary by default).
 
     Args:
-        query: Question or search terms from the MCP client.
+        query: Question from the Webex AI Agent / MCP client.
 
     Returns:
         MCP tool result with ``structuredContent.result`` (JSON string) per WxCC output schema.
@@ -384,115 +321,89 @@ def cisco_docs_query(query: str) -> ToolResult:
         )
         return _tool_result({"error": "query must not be empty"})
 
-    try:
-        token = fetch_client_credentials_token(settings, correlation_id=correlation_id)
-    except requests.HTTPError as e:
-        text = ""
-        if e.response is not None:
-            text = (e.response.text or "")[:_MAX_ERROR_BODY_CHARS]
-        sc = getattr(e.response, "status_code", None) if e.response is not None else None
-        logger.warning(
-            "tool_cisco_docs_query_oauth_failed correlation_id=%s status=%s",
-            correlation_id,
-            sc,
-        )
-        return _tool_result(
-            {
-                "error": "Failed to obtain OAuth token",
-                "status_code": sc,
-                "detail": text,
-            }
-        )
-    except requests.RequestException as e:
-        logger.warning(
-            "tool_cisco_docs_query_oauth_transport correlation_id=%s error=%s",
-            correlation_id,
-            _sanitize_one_line(str(e), 300),
-        )
-        return _tool_result({"error": "OAuth token request failed", "message": str(e)})
-    except RuntimeError as e:
-        logger.error(
-            "tool_cisco_docs_query_oauth_runtime correlation_id=%s error=%s",
-            correlation_id,
-            _sanitize_one_line(str(e), 300),
-        )
-        return _tool_result({"error": str(e)})
+    api_question = f"{VOICE_REPLY_INSTRUCTION}{q}" if settings.voice_optimized else q
+    max_retries = 3
 
-    body = {"dev": "true", "input": {"query": q}}
-
-    t_script = time.perf_counter()
-    try:
-        r = outbound_api_call(
-            settings,
-            purpose="CiscoScript_Mykola_Cisco_Docs",
-            method="POST",
-            url=settings.cisco_script_job_url,
-            correlation_id=correlation_id,
-            json=body,
-            headers={
-                "Authorization": f"Bearer {token}",
-                "Accept": "application/json",
-                "Content-Type": "application/json",
-            },
-        )
-        ct = (r.headers.get("Content-Type") or "").split(";")[0].strip()
-        logger.info(
-            "cisco_script_body correlation_id=%s content_type=%s text_chars=%s",
-            correlation_id,
-            _sanitize_one_line(ct, 80),
-            len(r.text or ""),
-        )
-        r.raise_for_status()
+    for attempt in range(max_retries):
         try:
-            logger.info(
-                "app_event kind=tool_payload outcome=success format=json correlation_id=%s",
-                correlation_id,
-            )
-            return _tool_result(r.json())
-        except ValueError:
-            logger.info(
-                "app_event kind=tool_payload outcome=success format=non_json_text correlation_id=%s",
-                correlation_id,
-            )
-            return _tool_result({"raw_text": (r.text or "")[:_MAX_ERROR_BODY_CHARS]})
+            r = _docs_ai_post(settings, question=api_question, correlation_id=correlation_id)
+            if r.status_code == 429 and attempt < max_retries - 1:
+                wait_s = 2**attempt
+                logger.warning(
+                    "docs_ai_429_retry correlation_id=%s attempt=%s wait_s=%s",
+                    correlation_id,
+                    attempt + 1,
+                    wait_s,
+                )
+                time.sleep(wait_s)
+                continue
+            r.raise_for_status()
+            try:
+                payload = r.json()
+            except ValueError:
+                return _tool_result(
+                    {"error": "Docs AI returned non-JSON", "raw": (r.text or "")[:_MAX_ERROR_BODY_CHARS]}
+                )
 
-    except requests.HTTPError as e:
-        text = ""
-        if e.response is not None:
-            text = (e.response.text or "")[:_MAX_ERROR_BODY_CHARS]
-        elapsed_ms = int((time.perf_counter() - t_script) * 1000)
-        sc = getattr(e.response, "status_code", None) if e.response is not None else None
-        logger.warning(
-            "app_event kind=CiscoScript_http outcome=failed http_status=%s http_outcome=%s "
-            "correlation_id=%s elapsed_ms=%s detail_prefix=%s",
-            sc,
-            _http_outcome_from_status(sc),
-            correlation_id,
-            elapsed_ms,
-            _sanitize_one_line(text, 120),
-        )
-        if sc == 403:
-            logger.warning(
-                "cisco_script_403_hint correlation_id=%s "
-                "upstream may block cloud egress or deny token/job scope; check Cisco scripts access",
+            raw_answer = payload.get("answer", "")
+            if not isinstance(raw_answer, str):
+                raw_answer = str(raw_answer) if raw_answer is not None else ""
+
+            confidence = payload.get("confidence", 0.0)
+            try:
+                confidence_f = float(confidence)
+            except (TypeError, ValueError):
+                confidence_f = 0.0
+
+            if settings.voice_optimized:
+                spoken = _format_answer_for_voice(raw_answer, settings.voice_max_sentences)
+                out: dict[str, Any] = {
+                    "answer": spoken,
+                    "confidence": confidence_f,
+                    "voice_optimized": True,
+                }
+            else:
+                out = {
+                    "answer": raw_answer,
+                    "confidence": confidence_f,
+                    "sources": payload.get("sources", []),
+                    "voice_optimized": False,
+                }
+
+            logger.info(
+                "tool_cisco_docs_query_success correlation_id=%s confidence=%s voice=%s",
                 correlation_id,
+                confidence_f,
+                settings.voice_optimized,
             )
-        return _tool_result(
-            {
-                "error": "Cisco script job HTTP error",
-                "status_code": sc,
-                "detail": text,
-            }
-        )
-    except requests.RequestException as e:
-        elapsed_ms = int((time.perf_counter() - t_script) * 1000)
-        logger.warning(
-            "app_event kind=CiscoScript_http outcome=network_error correlation_id=%s elapsed_ms=%s error=%s",
-            correlation_id,
-            elapsed_ms,
-            _sanitize_one_line(str(e), 300),
-        )
-        return _tool_result({"error": "Cisco script request failed", "message": str(e)})
+            return _tool_result(out)
+
+        except requests.HTTPError as e:
+            text = ""
+            if e.response is not None:
+                text = (e.response.text or "")[:_MAX_ERROR_BODY_CHARS]
+            sc = getattr(e.response, "status_code", None) if e.response is not None else None
+            logger.warning(
+                "tool_cisco_docs_query_http correlation_id=%s status=%s",
+                correlation_id,
+                sc,
+            )
+            return _tool_result(
+                {
+                    "error": "Docs AI HTTP error",
+                    "status_code": sc,
+                    "detail": text,
+                }
+            )
+        except requests.RequestException as e:
+            logger.warning(
+                "tool_cisco_docs_query_transport correlation_id=%s error=%s",
+                correlation_id,
+                _sanitize_one_line(str(e), 300),
+            )
+            return _tool_result({"error": "Docs AI request failed", "message": str(e)})
+
+    return _tool_result({"error": "Docs AI rate limited; retries exhausted"})
 
 
 class HttpAccessLogMiddleware(BaseHTTPMiddleware):
@@ -588,7 +499,6 @@ async def health_check(request: Request) -> Response:
 
 
 def main() -> None:
-    # Banner on stderr so container log collectors pick it up (same stream as logging).
     print("[cisco-ai-docs-mcp] process start", file=sys.stderr, flush=True)
     settings = get_settings()
     _configure_logging(settings)
@@ -610,18 +520,19 @@ def main() -> None:
     if not path.startswith("/"):
         path = "/" + path
 
-    #: Outermost middleware last: access log wraps auth + MCP routes.
     middleware_list.append(Middleware(HttpAccessLogMiddleware))
 
     logger.info(
         "startup service=cisco-ai-docs-mcp host=%s port=%s mcp_path=%s log_level=%s "
-        "ssl_verify=%s log_query_snippet=%s",
+        "ssl_verify=%s log_query_snippet=%s docs_ai_url=%s voice_optimized=%s",
         settings.host,
         settings.port,
         path,
         settings.log_level,
         settings.http_ssl_verify,
         settings.log_query_snippet,
+        _sanitize_one_line(settings.docs_ai_ask_url, 120),
+        settings.voice_optimized,
     )
 
     mcp.run(
@@ -631,7 +542,6 @@ def main() -> None:
         path=path,
         middleware=middleware_list,
         uvicorn_config={
-            # Custom HttpAccessLogMiddleware already logs each request in detail.
             "access_log": False,
             "log_level": (settings.log_level or "info").lower(),
         },
